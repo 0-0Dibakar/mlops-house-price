@@ -8,6 +8,10 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -33,3 +37,13 @@ jobs:
       - name: Run tests
         run: |
           pytest
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::477345794909:role/GitHubActions-MLOps-HousePrice
+          aws-region: ap-south-1
+
+      - name: Test AWS authentication
+        run: |
+          aws sts get-caller-identity

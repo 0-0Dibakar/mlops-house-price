@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+
+# IDE
+.vscode/
+
+# Environment/secrets
+.env
+*.pem
+
+# AWS
+.aws/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# MLflow
+mlruns/
+
+# Logs
+*.log
+# Trained ML model
+models/*.pkl

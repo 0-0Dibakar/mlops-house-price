@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+
   pull_request:
     branches:
       - main
@@ -12,63 +13,313 @@ permissions:
   contents: read
   id-token: write
 
+
+# ============================================================
+# JOB 1: TEST
+# Runs for both push and pull requests
+# ============================================================
 jobs:
-  build-and-push:
+
+  test:
+    name: Test Application
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout code
+
+      # --------------------------------------------------------
+      # Checkout code
+      # --------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Setup Python
+
+      # --------------------------------------------------------
+      # Setup Python
+      # --------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3. Install dependencies
+
+      # --------------------------------------------------------
+      # Install Python dependencies
+      # --------------------------------------------------------
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4. Train model
+
+      # --------------------------------------------------------
+      # Train model
+      #
+      # The .pkl model is ignored by Git, so we generate it
+      # during CI before running the API tests.
+      # --------------------------------------------------------
       - name: Train model
         run: |
           python src/train.py
 
-      # 5. Run tests
+
+      # --------------------------------------------------------
+      # Run tests
+      # --------------------------------------------------------
       - name: Run tests
         run: |
           pytest
 
-      # 6. Configure AWS using OIDC
+
+# ============================================================
+# JOB 2: BUILD + PUSH + DEPLOY
+#
+# Runs ONLY after tests pass
+# Runs ONLY when code is pushed to main
+# ============================================================
+
+  build-and-deploy:
+    name: Build, Push to ECR and Deploy to EC2
+
+    needs: test
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # --------------------------------------------------------
+      # Checkout code
+      # --------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      # --------------------------------------------------------
+      # Setup Python
+      # --------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+
+      # --------------------------------------------------------
+      # Install dependencies
+      # --------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+
+      # --------------------------------------------------------
+      # Train model
+      #
+      # This creates:
+      # models/house_price_model.pkl
+      #
+      # The model is then included in the Docker image.
+      # --------------------------------------------------------
+      - name: Train model
+        run: |
+          python src/train.py
+
+
+      # --------------------------------------------------------
+      # Configure AWS credentials
+      #
+      # Uses GitHub OIDC.
+      # No AWS access keys are stored in GitHub.
+      # --------------------------------------------------------
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::477345794909:role/GitHubActions-MLOps-HousePrice
           aws-region: ap-south-1
 
-      # 7. Login to Amazon ECR
+
+      # --------------------------------------------------------
+      # Login to Amazon ECR
+      # --------------------------------------------------------
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # 8. Build Docker image
+
+      # --------------------------------------------------------
+      # Build Docker image
+      #
+      # github.sha gives every deployment a unique image tag.
+      #
+      # Example:
+      # 477345794909.dkr.ecr.ap-south-1.amazonaws.com/
+      # mlops-house-price:abc123...
+      # --------------------------------------------------------
       - name: Build Docker image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: mlops-house-price
           IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $REGISTRY/$REPOSITORY:$IMAGE_TAG .
 
-      # 9. Push Docker image to ECR
+        run: |
+          echo "Building Docker image..."
+
+          docker build \
+            -t $REGISTRY/$REPOSITORY:$IMAGE_TAG \
+            .
+
+          echo "Docker image built successfully."
+
+
+      # --------------------------------------------------------
+      # Push Docker image to Amazon ECR
+      # --------------------------------------------------------
       - name: Push Docker image to ECR
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPOSITORY: mlops-house-price
           IMAGE_TAG: ${{ github.sha }}
+
         run: |
+          echo "Pushing Docker image to ECR..."
+
           docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
+
+          echo "Docker image pushed successfully."
+
+
+      # --------------------------------------------------------
+      # Deploy to EC2 using AWS Systems Manager
+      # --------------------------------------------------------
+      - name: Deploy to EC2 using SSM
+        id: deploy
+        env:
+          INSTANCE_ID: i-096d3ad6ea874a7a8
+          IMAGE_TAG: ${{ github.sha }}
+
+        run: |
+
+          echo "========================================="
+          echo "Starting EC2 deployment"
+          echo "========================================="
+
+          echo "EC2 Instance:"
+          echo "$INSTANCE_ID"
+
+          echo "Image:"
+          echo "477345794909.dkr.ecr.ap-south-1.amazonaws.com/mlops-house-price:$IMAGE_TAG"
+
+
+          # ----------------------------------------------------
+          # Send deployment commands to EC2
+          # ----------------------------------------------------
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy house price application" \
+            --parameters '{
+              "commands": [
+                "set -e",
+                "echo Starting deployment",
+                "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 477345794909.dkr.ecr.ap-south-1.amazonaws.com",
+                "docker pull 477345794909.dkr.ecr.ap-south-1.amazonaws.com/mlops-house-price:'"$IMAGE_TAG"'",
+                "docker stop mlops-house-price || true",
+                "docker rm mlops-house-price || true",
+                "docker run -d --name mlops-house-price -p 8000:8000 477345794909.dkr.ecr.ap-south-1.amazonaws.com/mlops-house-price:'"$IMAGE_TAG"'",
+                "echo Container started",
+                "sleep 10",
+                "curl -f http://localhost:8000/health",
+                "echo Deployment health check passed"
+              ]
+            }' \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          # Pass command ID to next GitHub Actions step
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+
+      # --------------------------------------------------------
+      # Wait for EC2 deployment to finish
+      # --------------------------------------------------------
+      - name: Wait for EC2 deployment
+        env:
+          INSTANCE_ID: i-096d3ad6ea874a7a8
+          COMMAND_ID: ${{ steps.deploy.outputs.command_id }}
+
+        run: |
+
+          echo "========================================="
+          echo "Waiting for EC2 deployment"
+          echo "========================================="
+
+          for i in {1..30}
+          do
+
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || true)
+
+            echo "Attempt $i/30"
+            echo "Status: $STATUS"
+
+
+            # --------------------------------------------------
+            # Deployment successful
+            # --------------------------------------------------
+            if [ "$STATUS" = "Success" ]; then
+
+              echo "========================================="
+              echo "Deployment successful!"
+              echo "========================================="
+
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query "StandardOutputContent" \
+                --output text
+
+              exit 0
+
+            fi
+
+
+            # --------------------------------------------------
+            # Deployment failed
+            # --------------------------------------------------
+            if [ "$STATUS" = "Failed" ] || \
+               [ "$STATUS" = "Cancelled" ] || \
+               [ "$STATUS" = "TimedOut" ]; then
+
+              echo "========================================="
+              echo "Deployment FAILED"
+              echo "========================================="
+
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --output json
+
+              exit 1
+
+            fi
+
+
+            # --------------------------------------------------
+            # Still running
+            # --------------------------------------------------
+            sleep 5
+
+          done
+
+
+          echo "========================================="
+          echo "Deployment timed out"
+          echo "========================================="
+
+          exit 1
